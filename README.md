@@ -11,7 +11,7 @@ Supports 2D and 3D forward modeling of Maxwell's equations—via the Finite-Diff
 
 Gradients of the output receiver data can be computed with respect to model parameters (relative permittivity, conductivity), the initial wavefield, and source amplitudes.
 
-Utilizes CPML, allowing the width of the PML layer to be configured independently for each boundary.
+Automatically extends the physical model into CPML, with an independent thickness for each boundary. Supply only air and the target region; material gradients retain the input model shape.
 
 The compute backend can run on CUDA GPUs or on CPU. The CPU backend is implemented in C and is selected automatically when `device='cpu'`.
 
@@ -186,7 +186,13 @@ result = DeepGPR.compute(
 | **`save_forward_wavefield_path`** | `str` / path-like / `None` | Directory used to save `E_saved` after a successful forward run. The default `None` performs no file I/O. Files use the local 24-hour start time, for example `forward_wavefield_14-35.pt`; a numeric suffix prevents overwriting when multiple runs start in the same minute. |
 ### 2. Medium Model Parameters
 
-This section defines the electromagnetic properties of the simulation space. For 2D simulations, set `nz=1`.
+Supply **only the physical model, including any air layer and the target region**. Do not include PML in `eps_r`, `sigma`, or `mu_r`. For 2D simulations use `(nx, ny)` or `(nx, ny, 1)`.
+
+Every `compute` call replicates the current material values at each boundary outward by `pmlthick`. For `[px0, px1, py0, py1, pz0, pz1]`, the internal grid is `Nx = nx + px0 + px1`, `Ny = ny + py0 + py1`, `Nz = nz + pz0 + pz1`. In 2D, `Nz = 1`. Sources and receivers use zero-based **input model coordinates**; the solver adds `[px0, py0, pz0]` internally without modifying your tensors. PML thickness can exceed the physical model size.
+
+After `loss.backward()`, `eps_r.grad` and `sigma.grad` have exactly their respective input shapes, including air cells. Update these physical tensors with your external FWI optimizer; the next call regenerates PML from the updated model. If air must remain fixed, apply your physical air mask in the optimizer.
+
+**Migration:** remove old manually padded PML cells and subtract the old low-face padding from acquisition indices. Keep actual air layers. Existing states generated on a different computational grid must be regenerated.
 
 | Parameter | Data Type | Shape | Description |
 | :--- | :--- | :--- | :--- |
@@ -203,8 +209,8 @@ This section defines the geometric observation system (coordinates) and the exci
 | Parameter | Data Type | Shape | Description |
 | :--- | :--- | :--- | :--- |
 | **`source_amplitudes`** | `Tensor` (float) | `(num_waveforms, nt, 1)` | Source excitation waveforms. `nt` is the total number of time steps.<br>- If `num_waveforms == 1`: All sources share this single waveform.<br>- If `num_waveforms == nsr`: Each source uses its corresponding waveform. |
-| **`source_location`** | `Tensor` (int) | `(nstep, nsr, 3)` | Grid coordinate indices of the sources.<br>The last dimension corresponds to `[x_idx, y_idx, z_idx]`. |
-| **`receiver_location`** | `Tensor` (int) | `(nstep, nrx, 3)` | Grid coordinate indices of the receivers.<br>The last dimension corresponds to `[x_idx, y_idx, z_idx]`. |
+| **`source_location`** | `Tensor` (int) | `(nstep, nsr, 3)` | Grid coordinate indices of the sources in the unextended physical model.<br>The last dimension corresponds to `[x_idx, y_idx, z_idx]`. |
+| **`receiver_location`** | `Tensor` (int) | `(nstep, nrx, 3)` | Grid coordinate indices of the receivers in the unextended physical model.<br>The last dimension corresponds to `[x_idx, y_idx, z_idx]`. |
 | **`source_direction`** | `int` | Scalar | Polarization direction/component of the source excitation.<br>`0` = X, `1` = Y, `2` = Z (e.g., exciting $E_z$). |
 | **`receiver_component`** (`reciever_direction`) | `int` | Scalar | The component recorded by the receivers.<br>`0` = $E_x$, `1` = $E_y$, `2` = $E_z$. The misspelled name remains as a deprecated alias. |
 
@@ -218,7 +224,7 @@ This section defines the geometric observation system (coordinates) and the exci
 
 | Parameter | Data Type | Format | Description |
 | :--- | :--- | :--- | :--- |
-| **`pmlthick`** | `int` / `list` / `Tensor`| Scalar or list of 6 | Thickness (in grid layers) of the PML (Perfectly Matched Layer) absorbing boundaries.<br>- Integer `p`: All six boundaries have thickness `p` (Z-boundaries are ignored in 2D).<br>- List `[x0, xm, y0, ym, z0, zm]`: Specific thicknesses for the 6 boundaries. |
+| **`pmlthick`** | `int` / `list` / `Tensor`| Scalar or list of 4/6 | External PML thickness in grid cells, added by edge replication.<br>- Integer `p`: All active boundaries have thickness `p` (no Z padding in 2D).<br>- `[x0, xm, y0, ym]`: X/Y faces with no Z PML.<br>- `[x0, xm, y0, ym, z0, zm]`: Six independent faces; Z values must be zero in 2D.<br>- Zero disables that face. |
 | **`model_gradient_sampling_interval`**| `int` | Scalar | Wavefield sampling interval during forward propagation (Default: 1).<br>A larger integer reduces VRAM use for `E_saved` and `R_saved`, but uses an explicitly approximate model gradient. The last incomplete sampling block is weighted by its actual length. |
 | **`save_wavefield_history`** | `bool` | Scalar | Independently controls allocation and native writes of the E/R histories used by adjoint model-gradient backward (Default: `True`). `False` still executes the complete FDTD, CPML, source-injection, and receiver-recording path, returns an empty `E_saved`, and raises a clear error if history-dependent backward is attempted. |
 | **`wavefield_storage_dtype`** | `torch.dtype` / `str` | `float32`, `float16`, or `bfloat16` | Storage format for saved `E_saved` and `R_saved` model-gradient wavefields. FDTD propagation remains float32. `float16` and `bfloat16` halve saved-wavefield memory at the cost of gradient accuracy; `bfloat16` has the safer dynamic range. String aliases such as `"fp16"` and `"bf16"` are accepted. |
@@ -242,11 +248,11 @@ When `eps_r` or `sigma` requires gradients, `mode=2` is restricted to 2D Ez-TM m
 
 The backward solver applies the exact reverse-mode transpose of each executed operation in reverse order: receiver sampling, source injection, electric CPML, electric update, magnetic CPML, and magnetic update. The derivative transpose is applied to the material-weighted field cotangent, so heterogeneous update coefficients and anisotropic grid spacing are handled by the executed discrete operator. Every electric and magnetic CPML auxiliary state has a separate cotangent recurrence on all six faces.
 
-CPML is treated as a fixed numerical boundary. Its boundary material averages are explicitly detached, and CPML cells are excluded from the returned material gradients. This separation must be retained when optimizing a model.
+CPML is treated as a fixed numerical boundary during backward. Boundary coefficient averages are detached, and gradients are cropped to the physical model; replicated PML sensitivities are not summed into model edges. All physical cells remain eligible for material gradients, including the first cell at a low face. PML materials and coefficients are rebuilt on the next forward call. Thus a finite-difference check must keep boundary values fixed (or freeze the extended PML and its coefficients explicitly); perturbing model edges and regenerating PML also changes a numerical boundary that this FWI gradient intentionally holds fixed.
 
 The material-gradient formulation in DeepGPR was informed in part by the differentiable FDTD implementation in [TIDE](https://github.com/Vcholerae1/tide-GPR), particularly its treatment of the discrete Maxwell electric-field update in gradient computation. We gratefully acknowledge the TIDE project and its authors for this work.
 
-Use `model_gradient_sampling_interval=1` and `wavefield_storage_dtype=torch.float32` for a directional derivative check in the physical model region. Temporal subsampling and lower-precision storage deliberately approximate the gradient. Run [the gradient-check notebook](examples/4.GradientCheck.ipynb) after rebuilding the native ABI 6 libraries.
+Use `model_gradient_sampling_interval=1` and `wavefield_storage_dtype=torch.float32` for a directional derivative check in the physical model region. Temporal subsampling and lower-precision storage deliberately approximate the gradient. Run [the gradient-check notebook](tests/03_gradient_2d.ipynb) after rebuilding the native ABI 6 libraries with `deepgpr_supports_external_pml`. See `tests/test_external_pml.py` for physical edge and checkpoint regression checks.
 
 ### 4.3 GPU-native block INT8 history
 
@@ -291,7 +297,7 @@ unless a separate numerical and gradient validation explicitly permits it.
 
 The new INT8 path deliberately keeps native ABI 6 because the forward/backward
 C signatures are unchanged. A capability symbol prevents an older ABI-6 CUDA
-library from accepting the packed storage code and corrupting memory.
+library from accepting the packed storage code and corrupting memory. External PML also requires the `deepgpr_supports_external_pml` capability on CPU and CUDA, including the INT8 gradient path. Rebuild native libraries on each target platform; older binaries are rejected for PML runs rather than silently dropping physical edge gradients.
 
 ## CPU Backend Build
 
@@ -326,9 +332,28 @@ For starting a forward simulation from scratch ($t=0$), these three parameters s
 
 | Parameter | Data Type | Shape | Description |
 | :--- | :--- | :--- | :--- |
-| **`E`** | `tuple` / `None` | 3 Tensors | Initial state of the electric field components `(Ex, Ey, Ez)`. Each tensor shape is `(nstep, nx+1, ny+1, nz+1)`. |
+| **`E`** | `tuple` / `None` | 3 Tensors | Initial state of the electric field components `(Ex, Ey, Ez)`. Each tensor shape is `(nstep, Nx+1, Ny+1, Nz+1)`, including external PML and the Yee field halo. |
 | **`H`** | `tuple` / `None` | 3 Tensors | Initial state of the magnetic field components `(Hx, Hy, Hz)`. Shapes identical to `E`. |
 | **`PML`** | `tuple` / `None` | 24 Tensors | Auxiliary state variables ($\Phi$ fields) for the PML boundary updates. |
+
+`checkpoint_initial_field` accepts the same unextended physical model and PML settings and allocates matching full-grid states. Pass returned `E`, `H`, and all 24 `PML` tensors back unchanged in shape. The solver only extends materials; it never pads checkpoint states again. Continuation requires identical model geometry, PML settings, and shot ordering, with consistent materials, grid spacing, and time step for that trajectory.
+
+The native solver advances input states in place. When a state is retained for PyTorch checkpoint recomputation or reused in another branch, clone every tensor before passing it to `compute`:
+
+```python
+# Inside a checkpointed segment; boundary contains E, H, then all 24 PML states.
+work = tuple(t.clone() for t in boundary)
+result = DeepGPR.compute(
+    device=device, dx=dx, dt=dt,
+    eps_r=eps_r, sigma=sigma,  # physical model on every segment
+    source_amplitudes=segment_source,
+    source_location=source_location, receiver_location=receiver_location,
+    pmlthick=pmlthick, E=work[:3], H=work[3:6], PML=work[6:],
+)
+return (*result[1], *result[2], *result[3], result[-1])
+```
+
+Keep material values fixed throughout one segmented trajectory and its backward pass. After the FWI optimizer step, start the next forward simulation from zero or from an initial state appropriate to that new model. See [the checkpoint example](tests/checkpoint_example.ipynb).
 
 ---
 
@@ -342,8 +367,9 @@ return E_saved, (Ex, Ey, Ez), (Hx, Hy, Hz), (x0EPhi1...zmHPhi2), receiver_amplit
 
 1.  **`E_saved`**: The pre-update electric field history `E^n` saved for gradient calculation and diagnostics. An internal `R_saved` tensor stores the corresponding discrete right-hand side `R^n`.
     *   With `save_wavefield_history=False`, `E_saved` is a zero-length tensor and neither E nor R history storage/compression kernels are launched.
-    *   **Shape when `mode=2`**: `(nt_saved, nstep, nx, ny, nz)`, storing Ez only.
-    *   **Shape when `mode=3`**: `(3, nt_saved, nstep, nx, ny, nz)`, storing components in `[Ex, Ey, Ez]` order.
+    *   **Shape when `mode=2`**: `(nt_saved, nstep, Nx, Ny, Nz)`, storing Ez only.
+    *   **Shape when `mode=3`**: `(3, nt_saved, nstep, Nx, Ny, Nz)`, storing components in `[Ex, Ey, Ez]` order.
+    *   `Nx`, `Ny`, `Nz` include external PML. Histories, saved files, and full E/H/PML states keep that grid; only material gradients are cropped. To plot a physical history, slice spatial axes with `[px0:px0+nx, py0:py0+ny, pz0:pz0+nz]`. Memory estimates use the extended grid.
     *   `nt_saved` depends on `nt` and `model_gradient_sampling_interval`.
     *   Dtype is selected by `wavefield_storage_dtype` when compression is disabled. With `wavefield_compression="int8"`, this is an opaque packed one-dimensional `torch.int8` tensor containing values and FP32 scales.
     *   Set `save_forward_wavefield_path="/path/to/output"` to save a CPU-loadable `.pt` file. Uncompressed modes save the tensor directly. INT8 mode saves a dictionary containing `wavefield`, `compression`, `block_size`, and `uncompressed_shape` so diagnostics can reconstruct it safely.

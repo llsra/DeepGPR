@@ -249,10 +249,14 @@ def max_abs_difference(actual: torch.Tensor, reference: torch.Tensor) -> float:
     )
 
 
-def normalized_interior_mask(
+def fixed_boundary_direction_mask(
     shape: Sequence[int], pml: int | Sequence[int], device: torch.device | str
 ) -> torch.Tensor:
-    """Return the material region not occupied by DeepGPR's in-model CPML."""
+    """Mask perturbations that would change the fixed external boundary.
+
+    This is only a finite-difference test direction mask, not a gradient mask.
+    The physical model's outermost cells remain invertible.
+    """
     ndim = len(shape)
     if isinstance(pml, int):
         values = [pml] * (2 * ndim)
@@ -267,18 +271,11 @@ def normalized_interior_mask(
     slices = []
     for axis, size in enumerate(shape):
         low, high = int(values[2 * axis]), int(values[2 * axis + 1])
-        start = low + 1 if low > 0 else 0
-        stop = size - high if high > 0 else size
+        start = 1 if low > 0 else 0
+        stop = size - 1 if high > 0 else size
         slices.append(slice(start, stop))
     mask[tuple(slices)] = True
     return mask
-
-
-def pml_boundary_mask(
-    shape: Sequence[int], pml: int | Sequence[int], device: torch.device | str
-) -> torch.Tensor:
-    """Return the complement of the physical material region."""
-    return ~normalized_interior_mask(shape, pml, device)
 
 
 def gradient_direction(gradient: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -334,12 +331,6 @@ def directional_derivative_rows(
 def best_relative_error(rows: Sequence[dict[str, float]]) -> float:
     """Return the smallest directional derivative error in a step sweep."""
     return min(float(row["relative_error"]) for row in rows)
-
-
-def boundary_absmax(gradient: torch.Tensor, boundary_mask: torch.Tensor) -> float:
-    """Return the maximum absolute gradient in CPML cells."""
-    values = gradient.detach()[boundary_mask]
-    return 0.0 if values.numel() == 0 else float(values.abs().max().item())
 
 
 def signal_rms(signal: torch.Tensor) -> float:

@@ -177,12 +177,13 @@ def _material_case(pml):
     loss = objective(eps_r, sigma)
     loss.backward()
 
+    # Keep replicated edge values fixed during finite-difference checks.
     mask = torch.ones_like(eps_base)
     if pml:
-        mask[: pml + 1] = 0.0
-        mask[-pml:] = 0.0
-        mask[:, : pml + 1] = 0.0
-        mask[:, -pml:] = 0.0
+        mask[:1] = 0.0
+        mask[-1:] = 0.0
+        mask[:, :1] = 0.0
+        mask[:, -1:] = 0.0
     direction_eps = torch.randn_like(eps_base) * mask
     direction_eps /= direction_eps.abs().max().clamp_min(1.0e-12)
     direction_eps *= 0.15

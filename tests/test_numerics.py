@@ -5,6 +5,7 @@ import math
 import re
 import tempfile
 import unittest
+import warnings
 
 import torch
 
@@ -696,18 +697,21 @@ class NumericsValidationTests(unittest.TestCase):
 
         self.assertLess(relative_error, 0.02)
 
-    def test_initialization_warns_for_acquisition_inside_pml(self):
+    def test_initialization_extends_pml_outside_acquisition(self):
         er = torch.full((12, 14), 4.0)
         se = torch.zeros_like(er)
         source = torch.zeros((1, 20, 1))
         source_location = torch.tensor([[[2, 7, 0]]], dtype=torch.int32)
         receiver_location = torch.tensor([[[6, 7, 0]]], dtype=torch.int32)
 
-        with self.assertWarnsRegex(RuntimeWarning, "source.*inside CPML"):
-            initialization(
+        with warnings.catch_warnings(record=True) as captured:
+            result = initialization(
                 torch.device("cpu"), er, se, None, source,
                 source_location, receiver_location, 0.02, 3.0e-11, 2, 2,
             )
+
+        self.assertFalse(captured)
+        self.assertEqual(result[2:5], (16, 18, 1))
 
     def test_long_3d_cpml_backward_remains_finite(self):
         nx, ny, nz = 20, 24, 24
@@ -742,7 +746,8 @@ class NumericsValidationTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(receiver).all().item())
         self.assertIsNotNone(er.grad)
         self.assertTrue(torch.isfinite(er.grad).all().item())
-        self.assertEqual(int(torch.count_nonzero(er.grad[:6]).item()), 0)
+        self.assertEqual(er.grad.shape, er.shape)
+        self.assertGreater(int(torch.count_nonzero(er.grad[:6]).item()), 0)
 
 
 if __name__ == "__main__":

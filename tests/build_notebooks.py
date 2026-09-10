@@ -85,7 +85,7 @@ NOTEBOOKS["00_local_backend_and_contracts.ipynb"] = notebook(
 
             This notebook proves that the repository-local Python package and native CPU
             library are used. It then checks the native ABI, deterministic execution,
-            finite nonzero output, CPML acquisition warnings, and invalid-input guards.
+            finite nonzero output, external PML dimensions and model-frame coordinates, and invalid-input guards.
             """
         ),
         code(BOOTSTRAP),
@@ -224,22 +224,22 @@ NOTEBOOKS["00_local_backend_and_contracts.ipynb"] = notebook(
                 lambda: DeepGPR.compute(**{**common_arguments, "fdtd_order": 6}),
             )
             expect_exception(
-                "overlapping CPML leaves no physical interior",
+                "negative PML thickness is rejected",
                 ValueError,
-                lambda: DeepGPR.compute(**{**common_arguments, "pmlthick": 10}),
+                lambda: DeepGPR.compute(**{**common_arguments, "pmlthick": -1}),
             )
 
-            pml_source = torch.tensor([[[4, 8, 0]]], dtype=torch.int32)
+            edge_source = torch.tensor([[[0, 8, 0]]], dtype=torch.int32)
             with warnings.catch_warnings(record=True) as captured:
                 warnings.simplefilter("always")
                 DeepGPR.compute(
-                    **{**common_arguments, "source_location": pml_source}
+                    **{**common_arguments, "source_location": edge_source}
                 )
             warning_messages = [str(item.message) for item in captured]
             vu.record_check(
                 CHECKS,
-                "acquisition point inside CPML emits a warning",
-                any("inside CPML" in message for message in warning_messages),
+                "physical edge acquisition needs no PML offset or warning",
+                not any("CPML" in message for message in warning_messages),
                 warnings=warning_messages,
             )
             """
@@ -540,25 +540,18 @@ NOTEBOOKS["02_cpml_absorption.ipynb"] = notebook(
             gradient_result = simulate(10, er=er, se=se)
             gradient_result[-1].square().mean().backward()
             vu.assert_finite("CPML model gradients", er.grad, se.grad)
-            boundary = vu.pml_boundary_mask(er.shape, 10, DEVICE)
-            interior = ~boundary
-            er_boundary_absmax = vu.boundary_absmax(er.grad, boundary)
-            se_boundary_absmax = vu.boundary_absmax(se.grad, boundary)
-            er_interior_absmax = float(er.grad[interior].abs().max())
-            se_interior_absmax = float(se.grad[interior].abs().max())
             vu.record_check(
                 CHECKS,
-                "relative-permittivity gradient is exactly zero in CPML cells",
-                er_boundary_absmax == 0.0 and er_interior_absmax > 0.0,
-                boundary_absmax=er_boundary_absmax,
-                interior_absmax=er_interior_absmax,
+                "material gradients contain only the input model",
+                er.grad.shape == er_base.shape and se.grad.shape == se_base.shape
+                and float(er.grad.abs().max()) > 0 and float(se.grad.abs().max()) > 0,
+                model_shape=list(er.shape), gradient_shape=list(er.grad.shape),
             )
             vu.record_check(
                 CHECKS,
-                "conductivity gradient is exactly zero in CPML cells",
-                se_boundary_absmax == 0.0 and se_interior_absmax > 0.0,
-                boundary_absmax=se_boundary_absmax,
-                interior_absmax=se_interior_absmax,
+                "solver states and histories retain the external PML",
+                tuple(gradient_result[1][0].shape[1:]) == (nx + 21, ny + 21, 2)
+                and tuple(gradient_result[0].shape[-3:]) == (nx + 20, ny + 20, 1),
             )
             """
         ),
@@ -613,8 +606,7 @@ NOTEBOOKS["03_gradient_2d.ipynb"] = notebook(
                 [[[6, 14, 0], [6, 18, 0], [6, 22, 0]]], dtype=torch.int32
             )
             source = DeepGPR.wavelet.ricker(2.5e8, nt, dt, 4.0e-9).reshape(1, nt, 1)
-            interior = vu.normalized_interior_mask((nx, ny), pml, DEVICE)
-            boundary = ~interior
+            interior = vu.fixed_boundary_direction_mask((nx, ny), pml, DEVICE)
             """
         ),
         code(
@@ -695,11 +687,10 @@ NOTEBOOKS["03_gradient_2d.ipynb"] = notebook(
                 )
                 vu.record_check(
                     CHECKS,
-                    f"order {order} CPML material-gradient exclusion",
-                    vu.boundary_absmax(er.grad, boundary) == 0.0
-                    and vu.boundary_absmax(se.grad, boundary) == 0.0,
-                    er_boundary_absmax=vu.boundary_absmax(er.grad, boundary),
-                    se_boundary_absmax=vu.boundary_absmax(se.grad, boundary),
+                    f"order {order} physical model gradient shape",
+                    er.grad.shape == er.shape
+                    and se.grad.shape == se.shape,
+                    model_shape=list(er.shape),
                 )
             """
         ),
@@ -759,8 +750,7 @@ NOTEBOOKS["04_gradient_3d.ipynb"] = notebook(
                 [[[6, 5, 6], [10, 5, 10]]], dtype=torch.int32
             )
             source = DeepGPR.wavelet.ricker(4.0e8, nt, dt, 2.5e-9).reshape(1, nt, 1)
-            interior = vu.normalized_interior_mask((nx, ny, nz), pml, DEVICE)
-            boundary = ~interior
+            interior = vu.fixed_boundary_direction_mask((nx, ny, nz), pml, DEVICE)
             """
         ),
         code(
@@ -849,11 +839,10 @@ NOTEBOOKS["04_gradient_3d.ipynb"] = notebook(
                     )
                     vu.record_check(
                         CHECKS,
-                        f"3D CPML gradient exclusion: {case_name}",
-                        vu.boundary_absmax(er.grad, boundary) == 0.0
-                        and vu.boundary_absmax(se.grad, boundary) == 0.0,
-                        er_boundary_absmax=vu.boundary_absmax(er.grad, boundary),
-                        se_boundary_absmax=vu.boundary_absmax(se.grad, boundary),
+                        f"3D physical model gradient shape: {case_name}",
+                        er.grad.shape == er.shape
+                        and se.grad.shape == se.shape,
+                        model_shape=list(er.shape),
                     )
             """
         ),
@@ -1378,7 +1367,7 @@ NOTEBOOKS["07_long_run_stability.ipynb"] = notebook(
                 fields = (*result[1], *result[2], *result[3], result[-1])
                 vu.assert_finite("long-run fields", *fields)
                 vu.assert_finite("long-run gradients", er.grad, se.grad)
-                boundary = vu.pml_boundary_mask(shape, pml, device)
+
                 return {
                     "device": str(device),
                     "dimension": dimension,
@@ -1388,8 +1377,8 @@ NOTEBOOKS["07_long_run_stability.ipynb"] = notebook(
                     "receiver_absmax": float(result[-1].detach().abs().max().cpu()),
                     "er_gradient_absmax": float(er.grad.detach().abs().max().cpu()),
                     "se_gradient_absmax": float(se.grad.detach().abs().max().cpu()),
-                    "er_boundary_absmax": vu.boundary_absmax(er.grad, boundary),
-                    "se_boundary_absmax": vu.boundary_absmax(se.grad, boundary),
+                    "er_shape_matches": er.grad.shape == er.shape,
+                    "se_shape_matches": se.grad.shape == se.shape,
                 }
             """
         ),
@@ -1406,8 +1395,8 @@ NOTEBOOKS["07_long_run_stability.ipynb"] = notebook(
                             row["receiver_absmax"] > 0.0
                             and row["er_gradient_absmax"] > 0.0
                             and row["se_gradient_absmax"] > 0.0
-                            and row["er_boundary_absmax"] == 0.0
-                            and row["se_boundary_absmax"] == 0.0,
+                            and row["er_shape_matches"]
+                            and row["se_shape_matches"],
                             **row,
                         )
                         if device.type == "cuda":
@@ -1483,9 +1472,11 @@ NOTEBOOKS["08_openmp_parallelism.ipynb"] = notebook(
                         stdout=completed.stdout,
                         stderr=completed.stderr,
                     )
-                    thread_results[thread_count] = torch.load(
-                        output_path, map_location="cpu", weights_only=True
-                    )
+                    import inspect
+                    load_options = {"map_location": "cpu"}
+                    if "weights_only" in inspect.signature(torch.load).parameters:
+                        load_options["weights_only"] = True
+                    thread_results[thread_count] = torch.load(output_path, **load_options)
             """
         ),
         code(
@@ -1868,7 +1859,7 @@ NOTEBOOKS["09_anisotropic_grid.ipynb"] = notebook(
             source = DeepGPR.wavelet.ricker(3.0e8, nt, dt, 3.0e-9).reshape(1, nt, 1)
             source_location = torch.tensor([[[6, 7, 0]]], dtype=torch.int32)
             receiver_location = torch.tensor([[[6, 13, 0]]], dtype=torch.int32)
-            boundary_2d = vu.pml_boundary_mask((nx, ny), pml, CPU)
+
             gradient_rows = []
 
             def simulate_2d(er_value, se_value, order):
@@ -1901,8 +1892,8 @@ NOTEBOOKS["09_anisotropic_grid.ipynb"] = notebook(
                     "receiver_absmax": float(receiver.detach().abs().max()),
                     "er_gradient_absmax": float(er.grad.detach().abs().max()),
                     "se_gradient_absmax": float(se.grad.detach().abs().max()),
-                    "er_boundary_absmax": vu.boundary_absmax(er.grad, boundary_2d),
-                    "se_boundary_absmax": vu.boundary_absmax(se.grad, boundary_2d),
+                    "er_shape_matches": er.grad.shape == er.shape,
+                    "se_shape_matches": se.grad.shape == se.shape,
                 }
                 gradient_rows.append(row)
                 vu.record_check(
@@ -1911,8 +1902,8 @@ NOTEBOOKS["09_anisotropic_grid.ipynb"] = notebook(
                     row["receiver_absmax"] > 0.0
                     and row["er_gradient_absmax"] > 0.0
                     and row["se_gradient_absmax"] > 0.0
-                    and row["er_boundary_absmax"] == 0.0
-                    and row["se_boundary_absmax"] == 0.0,
+                    and row["er_shape_matches"]
+                    and row["se_shape_matches"],
                     **row,
                 )
 
@@ -2009,13 +2000,13 @@ NOTEBOOKS["09_anisotropic_grid.ipynb"] = notebook(
                 er_3d.grad,
                 se_3d.grad,
             )
-            boundary_3d = vu.pml_boundary_mask(shape_3d, pml_3d, CPU)
+
             row_3d = {
                 "receiver_absmax": float(receiver_3d.detach().abs().max()),
                 "er_gradient_absmax": float(er_3d.grad.detach().abs().max()),
                 "se_gradient_absmax": float(se_3d.grad.detach().abs().max()),
-                "er_boundary_absmax": vu.boundary_absmax(er_3d.grad, boundary_3d),
-                "se_boundary_absmax": vu.boundary_absmax(se_3d.grad, boundary_3d),
+                "er_shape_matches": er_3d.grad.shape == er_3d.shape,
+                "se_shape_matches": se_3d.grad.shape == se_3d.shape,
             }
             vu.record_check(
                 CHECKS,
@@ -2023,8 +2014,8 @@ NOTEBOOKS["09_anisotropic_grid.ipynb"] = notebook(
                 row_3d["receiver_absmax"] > 0.0
                 and row_3d["er_gradient_absmax"] > 0.0
                 and row_3d["se_gradient_absmax"] > 0.0
-                and row_3d["er_boundary_absmax"] == 0.0
-                and row_3d["se_boundary_absmax"] == 0.0,
+                and row_3d["er_shape_matches"]
+                and row_3d["se_shape_matches"],
                 **row_3d,
             )
             """

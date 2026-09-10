@@ -9,6 +9,7 @@ from .common import (
     _normalize_grid_spacing,
     initialization,
     build_pml_phi,
+    _shift_locations,
     create_or_separate,
     build_pml_coeffs,
     check_tensors_for_nan_inf,
@@ -491,7 +492,10 @@ def _print_compute_preview(
     print("\n=== DeepGPR compute preview ===")
     print("Simulation")
     print(f"  device: {device}")
-    print(f"  model shape: ({nx}, {ny}, {nz})")
+    model_shape = tuple(size - pml[2 * axis] - pml[2 * axis + 1]
+                        for axis, size in enumerate((nx, ny, nz)))
+    print(f"  model shape: {model_shape}")
+    print(f"  computational shape (including PML): ({nx}, {ny}, {nz})")
     print(f"  padded field shape: ({nx + 1}, {ny + 1}, {nz + 1})")
     print(f"  shots / sources per shot / receivers per shot: {nstep} / {nsr} / {nrx}")
     print(f"  time steps: {nt}")
@@ -757,15 +761,18 @@ def compute(device, dx=None, dt=None,
         dx: Scalar grid spacing or a three-value ``(dx, dy, dz)`` sequence.
         dt: Time step size.
         source_amplitudes: Source waveform tensor with shape (nwaveforms, nt, 1).
-        source_location: Source coordinates with shape (nstep, nsr, 3).
-        receiver_location: Receiver coordinates with shape (nstep, nrx, 3).
+        source_location: Coordinates in the unextended input model, shape (nstep, nsr, 3).
+        receiver_location: Coordinates in the unextended input model, shape (nstep, nrx, 3).
         er: Deprecated alias for eps_r.
         se: Deprecated alias for sigma.
         mr: Deprecated alias for mu_r.
         E: Optional initial electric field tuple (Ex, Ey, Ez).
         H: Optional initial magnetic field tuple (Hx, Hy, Hz).
-        PML: Optional tuple of 24 PML auxiliary tensors.
-        pmlthick: PML thickness as an int, list, or tensor.
+        PML: Optional tuple of 24 full-grid PML auxiliary tensors. E, H, and
+            PML returned by compute/checkpoint_initial_field are passed unchanged;
+            never crop or re-pad checkpoint states.
+        pmlthick: External edge-replicated PML thickness: int, four x/y values,
+            or six values [x0, xm, y0, ym, z0, zm]. 2D z values must be zero.
         source_direction: Source electric-field polarization, 0 for x, 1 for y, 2 for z.
         reciever_direction: Deprecated alias for receiver_component.
         model_gradient_sampling_interval: Forward wavefield sampling interval for FWI gradients.
@@ -794,7 +801,9 @@ def compute(device, dx=None, dt=None,
         print_parameters: Whether to print a preflight parameter and memory preview.
         save_forward_wavefield_path: Directory used to save E_saved as
             ``forward_wavefield_HH-MM.pt``. None disables file output.
-        eps_r: Relative permittivity tensor with shape (nx, ny) or (nx, ny, nz).
+        eps_r: Physical model (air and target region only), shape (nx, ny)
+            or (nx, ny, nz). PML is added internally on every call. Material
+            gradients have exactly the input shape; PML sensitivities are excluded.
         sigma: Electrical conductivity tensor with the same shape as eps_r.
         mu_r: Relative permeability tensor, or None to use ones.
         receiver_component: Receiver component to return, 0 for x, 1 for y, 2 for z.
@@ -914,6 +923,9 @@ def compute(device, dx=None, dt=None,
     grid_spacing = _normalize_grid_spacing(dx)
     mu_r_supplied = mu_r is not None
     eps_r,sigma,nx,ny,nz,nt,nstep,nsr,nrx,eps_r_pad,sigma_pad,mu_r,spatial_mode,dtype,pmlthick,source_amplitudes=initialization(device,eps_r,sigma,mu_r,source_amplitudes,source_location,receiver_location,grid_spacing,dt,pmlthick,fdtd_order)
+
+    source_location = _shift_locations(source_location, pmlthick, device)
+    receiver_location = _shift_locations(receiver_location, pmlthick, device)
 
     compression_block_size = (
         _normalize_compression_block_size(
@@ -1098,6 +1110,13 @@ class DeepGPR(torch.autograd.Function):
             device=device, dtype=torch.int32
         ).contiguous()
         c_lib = get_deepgpr_lib(device)
+        if bool(pmlthick.any()):
+            capability = getattr(c_lib, "deepgpr_supports_external_pml", None)
+            if capability is None or int(capability()) != 1:
+                raise RuntimeError(
+                    "The loaded library lacks external-PML material gradients. "
+                    "Rebuild the CPU/CUDA shared libraries from the current sources."
+                )
         set_library_fdtd_order(c_lib, fdtd_order)
         (
             wavefield_storage_dtype,

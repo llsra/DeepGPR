@@ -38,34 +38,40 @@ def _normalize_grid_spacing(value):
         raise ValueError("dx, dy, and dz must be finite positive scalars.")
     return spacing
 
-def _locations_in_pml(locations, shape, pml):
-    """Return a mask for acquisition coordinates that overlap CPML."""
-    inside = torch.zeros(locations.shape[:-1], dtype=torch.bool, device=locations.device)
-    for axis, size in enumerate(shape):
-        low = int(pml[2 * axis])
-        high = int(pml[2 * axis + 1])
-        if low > 0:
-            inside |= locations[..., axis] <= low
-        if high > 0:
-            inside |= locations[..., axis] >= size - high
-    return inside
+class _ExtendModel(torch.autograd.Function):
+    """Replicate materials into fixed PML cells; backward returns only the model.
 
+    PML is rebuilt from current boundary values on every forward call, but is
+    not an inversion parameter. In particular, do not sum halo sensitivities
+    into edge cells as the ordinary replicate-pad backward would do.
+    """
 
-def _warn_for_pml_location_count(name, count):
-    """Emit the standard acquisition-in-CPML warning for a known count."""
-    if count:
-        warnings.warn(
-            f"{count} {name} coordinate(s) lie inside CPML. DeepGPR's CPML occupies "
-            "cells inside the supplied model; place acquisition points in the physical "
-            "interior (low_pml < index < size - high_pml) to avoid attenuated data and "
-            "unreliable boundary sensitivity.",
-            RuntimeWarning,
-            stacklevel=3,
+    @staticmethod
+    def forward(ctx, model, pml):
+        ctx.model_slices = tuple(
+            slice(pml[2 * axis], pml[2 * axis] + size)
+            for axis, size in enumerate(model.shape)
         )
+        padding = (pml[4], pml[5], pml[2], pml[3], pml[0], pml[1])
+        return F.pad(model[None, None], padding, mode="replicate")[0, 0]
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient[ctx.model_slices].contiguous(), None
+
+
+def _shift_locations(locations, pmlthick, device):
+    """Map already validated model coordinates to the extended solver grid."""
+    offset = pmlthick[::2].to(device=device, dtype=torch.int32)
+    return (locations.to(device=device, dtype=torch.int32) + offset).contiguous()
 
 
 def initialization(device, er,se,mr,source_amplitudes,source_location,receiver_location,dx,dt,pmlthick,fdtd_order=2):
-    """Validate inputs and prepare model, source, receiver, and PML metadata.
+    """Validate physical-model inputs and extend materials into external PML.
+
+    Coordinates are validated in the input model frame. The returned materials
+    and dimensions include PML; callers map coordinates with _shift_locations.
+    Only the original model slice participates in material backward.
 
     Args:
         device: PyTorch device where tensors will be stored.
@@ -180,13 +186,14 @@ def initialization(device, er,se,mr,source_amplitudes,source_location,receiver_l
     pml_values = [int(value) for value in pmlthick.tolist()]
     if any(value < 0 for value in pml_values):
         raise ValueError("PML thicknesses must be non-negative.")
-    for axis, size in enumerate((nx, ny, nz)):
-        low, high = pml_values[2 * axis:2 * axis + 2]
-        if low + high > max(size - 2, 0):
-            raise ValueError(
-                f"PML thicknesses on axis {axis} leave no physical interior: "
-                f"low={low}, high={high}, size={size}."
-            )
+    if nz == 1 and any(pml_values[4:]):
+        raise ValueError("2D models require zero PML thickness on the z boundaries.")
+    extended_shape = tuple(
+        size + pml_values[2 * axis] + pml_values[2 * axis + 1]
+        for axis, size in enumerate((nx, ny, nz))
+    )
+    if any(size >= torch.iinfo(torch.int32).max for size in extended_shape):
+        raise ValueError("Extended model dimensions must fit in positive int32 with a field halo.")
 
     shape_tensor = torch.tensor((nx, ny, nz), dtype=torch.int32, device=device)
     source_integral = (
@@ -201,8 +208,6 @@ def initialization(device, er,se,mr,source_amplitudes,source_location,receiver_l
     )
     source_valid = ((source_location >= 0) & (source_location < shape_tensor)).all()
     receiver_valid = ((receiver_location >= 0) & (receiver_location < shape_tensor)).all()
-    source_in_pml = _locations_in_pml(source_location, (nx, ny, nz), pml_values)
-    receiver_in_pml = _locations_in_pml(receiver_location, (nx, ny, nz), pml_values)
     stats = torch.stack(
         (
             torch.isfinite(er).all().to(dtype),
@@ -217,15 +222,12 @@ def initialization(device, er,se,mr,source_amplitudes,source_location,receiver_l
             receiver_valid.to(dtype),
             source_integral.to(dtype),
             receiver_integral.to(dtype),
-            source_in_pml.sum().to(dtype),
-            receiver_in_pml.sum().to(dtype),
         )
     ).detach().cpu().tolist()
     er_finite, se_finite, mr_finite, source_finite = (bool(value) for value in stats[:4])
     er_min, se_min, mr_min, min_er_mr = stats[4:8]
     source_valid, receiver_valid = (bool(value) for value in stats[8:10])
     source_integral, receiver_integral = (bool(value) for value in stats[10:12])
-    source_pml_count, receiver_pml_count = (int(value) for value in stats[12:14])
 
     for name, finite in (
         ("er", er_finite), ("se", se_finite), ("mr", mr_finite),
@@ -255,11 +257,14 @@ def initialization(device, er,se,mr,source_amplitudes,source_location,receiver_l
         )
 
     check_cfl(
-        spacing, dt, nx, ny, nz, fdtd_order=fdtd_order,
+        spacing, dt, *extended_shape, fdtd_order=fdtd_order,
         _material_min_er_mr=min_er_mr,
     )
-    _warn_for_pml_location_count("source", source_pml_count)
-    _warn_for_pml_location_count("receiver", receiver_pml_count)
+    if any(pml_values):
+        er = _ExtendModel.apply(er, pml_values)
+        se = _ExtendModel.apply(se, pml_values)
+        mr = _ExtendModel.apply(mr, pml_values)
+    nx, ny, nz = extended_shape
 
     ere=F.pad(er, (0, 1, 0, 1, 0, 1))
     see=F.pad(se, (0, 1, 0, 1, 0, 1))
@@ -951,7 +956,11 @@ def checkpoint_initial_field(device=None,per_nstep=None, dx=None, dt=None,
             receiver_location=None, 
             er=None, se=None,mr=None, 
             pmlthick=10, fdtd_order=2):
-    """Create initial electric, magnetic, and PML field checkpoints.
+    """Create full solver-grid electric, magnetic, and PML checkpoints.
+
+    Supply only the physical model (including air), just as for compute. Fields
+    include external PML and the one-cell Yee halo. Pass these states back to
+    compute unchanged with the same model shape, PML thickness, and shot batch.
 
     Args:
         device: PyTorch device where tensors will be allocated.
@@ -975,6 +984,12 @@ def checkpoint_initial_field(device=None,per_nstep=None, dx=None, dt=None,
         device,er,se,mr,source_amplitudes,source_location,receiver_location,
         dx,dt,pmlthick,fdtd_order)
 
+    if per_nstep is not None:
+        if isinstance(per_nstep, bool) or not isinstance(per_nstep, int):
+            raise TypeError("per_nstep must be an integer shot count or None.")
+        if not 1 <= per_nstep <= nstep:
+            raise ValueError("per_nstep must be between 1 and the input shot count.")
+
     Ex,Ey,Ez=create_or_separate(E,nx,ny,nz,nstep,device,dtype)
     Hx,Hy,Hz=create_or_separate(H,nx,ny,nz,nstep,device,dtype)
 
@@ -985,12 +1000,21 @@ def checkpoint_initial_field(device=None,per_nstep=None, dx=None, dt=None,
 
     del x01,x02,xm1,xm2,y01,y02,ym1,ym2,z01,z02,zm1,zm2
 
-    if per_nstep==None:
-        return (Ex,Ey,Ez),(Hx,Hy,Hz),(x0EPhi1,x0EPhi2,x0HPhi1,x0HPhi2,xmEPhi1,xmEPhi2,xmHPhi1,xmHPhi2,y0EPhi1,y0EPhi2,y0HPhi1,y0HPhi2,ymEPhi1,ymEPhi2,ymHPhi1,ymHPhi2,z0EPhi1,z0EPhi2,z0HPhi1,z0HPhi2,zmEPhi1,zmEPhi2,zmHPhi1,zmHPhi2)
-    elif er.shape[2]==1:
-        return (Ex[:per_nstep,:,:,:],Ey[:per_nstep,:,:,:],Ez[:per_nstep,:,:,:]),(Hx[:per_nstep,:,:,:],Hy[:per_nstep,:,:,:],Hz[:per_nstep,:,:,:]),(x0EPhi1[:per_nstep,:,:,:],x0EPhi2[:per_nstep,:,:,:],x0HPhi1[:per_nstep,:,:,:],x0HPhi2[:per_nstep,:,:,:],xmEPhi1[:per_nstep,:,:,:],xmEPhi2[:per_nstep,:,:,:],xmHPhi1[:per_nstep,:,:,:],xmHPhi2[:per_nstep,:,:,:],y0EPhi1[:per_nstep,:,:,:],y0EPhi2[:per_nstep,:,:,:],y0HPhi1[:per_nstep,:,:,:],y0HPhi2[:per_nstep,:,:,:],ymEPhi1[:per_nstep,:,:,:],ymEPhi2[:per_nstep,:,:,:],ymHPhi1[:per_nstep,:,:,:],ymHPhi2[:per_nstep,:,:,:],z0EPhi1,z0EPhi2,z0HPhi1,z0HPhi2,zmEPhi1,zmEPhi2,zmHPhi1,zmHPhi2)
-    else:
-        return (Ex[:per_nstep,:,:,:],Ey[:per_nstep,:,:,:],Ez[:per_nstep,:,:,:]),(Hx[:per_nstep,:,:,:],Hy[:per_nstep,:,:,:],Hz[:per_nstep,:,:,:]),(x0EPhi1[:per_nstep,:,:,:],x0EPhi2[:per_nstep,:,:,:],x0HPhi1[:per_nstep,:,:,:],x0HPhi2[:per_nstep,:,:,:],xmEPhi1[:per_nstep,:,:,:],xmEPhi2[:per_nstep,:,:,:],xmHPhi1[:per_nstep,:,:,:],xmHPhi2[:per_nstep,:,:,:],y0EPhi1[:per_nstep,:,:,:],y0EPhi2[:per_nstep,:,:,:],y0HPhi1[:per_nstep,:,:,:],y0HPhi2[:per_nstep,:,:,:],ymEPhi1[:per_nstep,:,:,:],ymEPhi2[:per_nstep,:,:,:],ymHPhi1[:per_nstep,:,:,:],ymHPhi2[:per_nstep,:,:,:],z0EPhi1[:per_nstep,:,:,:],z0EPhi2[:per_nstep,:,:,:],z0HPhi1[:per_nstep,:,:,:],z0HPhi2[:per_nstep,:,:,:],zmEPhi1[:per_nstep,:,:,:],zmEPhi2[:per_nstep,:,:,:],zmHPhi1[:per_nstep,:,:,:],zmHPhi2[:per_nstep,:,:,:])
+    fields = ((Ex, Ey, Ez), (Hx, Hy, Hz), (
+        x0EPhi1, x0EPhi2, x0HPhi1, x0HPhi2,
+        xmEPhi1, xmEPhi2, xmHPhi1, xmHPhi2,
+        y0EPhi1, y0EPhi2, y0HPhi1, y0HPhi2,
+        ymEPhi1, ymEPhi2, ymHPhi1, ymHPhi2,
+        z0EPhi1, z0EPhi2, z0HPhi1, z0HPhi2,
+        zmEPhi1, zmEPhi2, zmHPhi1, zmHPhi2,
+    ))
+    if per_nstep is None:
+        return fields
+    # Disabled faces use one-dimensional empty tensors, with no shot axis.
+    return tuple(
+        tuple(tensor[:per_nstep] if tensor.numel() else tensor for tensor in group)
+        for group in fields
+    )
 
 
 def zero_field(*tensors):

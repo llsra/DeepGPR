@@ -165,6 +165,12 @@ static float load_wavefield_value(const void* pointer, long long index, int stor
 
 static int g_fdtd_order = 2;
 
+/* External PML keeps the first physical cell at each low face invertible. */
+DEEPGPR_API int deepgpr_supports_external_pml(void)
+{
+    return 1;
+}
+
 DEEPGPR_API int deepgpr_abi_version(void)
 {
     return DEEPGPR_ABI_VERSION;
@@ -1482,11 +1488,11 @@ static void accumulate_material_gradients_cpu(
         long long iz = rem % sz;
 
         /* CPML is a numerical boundary, not part of the invertible model. */
-        if ((pml0 > 0 && ix <= pml0) ||
+        if ((pml0 > 0 && ix < pml0) ||
             (pml1 > 0 && ix >= sx - pml1) ||
-            (pml2 > 0 && iy <= pml2) ||
+            (pml2 > 0 && iy < pml2) ||
             (pml3 > 0 && iy >= sy - pml3) ||
-            (pml4 > 0 && iz <= pml4) ||
+            (pml4 > 0 && iz < pml4) ||
             (pml5 > 0 && iz >= sz - pml5)) {
             continue;
         }

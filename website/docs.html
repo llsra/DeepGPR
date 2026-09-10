@@ -72,7 +72,7 @@ result = DeepGPR.compute(
 receiver_data = result[-1]
 receiver_data.square().sum().backward()
 print(receiver_data.shape, eps_r.grad.shape)</code></pre></div>
-          <p>The final tuple element is receiver data with shape <code>(nstep, nt, nrx)</code>. Calling <code>backward()</code> populates requested gradients through PyTorch autograd.</p>
+          <p>The final tuple element is receiver data with shape <code>(nstep, nt, nrx)</code>. Calling <code>backward()</code> returns material gradients with exactly the input model shape, including air. PML is outside that shape.</p>
         </section>
 
         <section class="content-panel" id="devices">
@@ -101,7 +101,7 @@ result = DeepGPR.compute(
           <div class="doc-grid">
             <article class="info-card"><span class="card-tag">Grid</span><h3>Isotropic or anisotropic spacing</h3><p>Pass one scalar <code>dx</code> or three values for independent x, y, and z grid spacing.</p></article>
             <article class="info-card"><span class="card-tag">Stencil</span><h3>Order 2, 4, or 8</h3><p>Select the spatial finite-difference order with <code>fdtd_order</code>; the default is 2.</p></article>
-            <article class="info-card"><span class="card-tag">Boundary</span><h3>Six-face CPML</h3><p><code>pmlthick</code> accepts one thickness or six boundary-specific values.</p></article>
+            <article class="info-card"><span class="card-tag">Boundary</span><h3>Six-face CPML</h3><p><code>pmlthick</code> adds external layers by copying material edge values. Use one thickness, four X/Y values, or six face values. In 2D, Z thicknesses must be zero.</p></article>
             <article class="info-card"><span class="card-tag">Polarization</span><h3>Electric-field components</h3><p>Source and receiver components use 0 = Ex, 1 = Ey, and 2 = Ez.</p></article>
           </div>
           <h3>Gradient modes</h3>
@@ -116,15 +116,19 @@ result = DeepGPR.compute(
             <tr><td>dx</td><td>Grid spacing in metres</td><td>Scalar or three values</td></tr>
             <tr><td>dt</td><td>Time-step size, checked against a material-aware CFL limit</td><td>Positive scalar</td></tr>
             <tr><td>source_amplitudes</td><td>Source waveforms</td><td><code>(nwaveforms, nt, 1)</code></td></tr>
-            <tr><td>source_location</td><td>Source grid coordinates</td><td><code>(nstep, nsr, 3)</code></td></tr>
-            <tr><td>receiver_location</td><td>Receiver grid coordinates</td><td><code>(nstep, nrx, 3)</code></td></tr>
+            <tr><td>source_location</td><td>Source coordinates in the physical input model</td><td><code>(nstep, nsr, 3)</code></td></tr>
+            <tr><td>receiver_location</td><td>Receiver coordinates in the physical input model</td><td><code>(nstep, nrx, 3)</code></td></tr>
             <tr><td>eps_r</td><td>Relative permittivity, values ≥ 1</td><td>2D or 3D tensor</td></tr>
             <tr><td>sigma</td><td>Electrical conductivity, non-negative</td><td>Tensor matching <code>eps_r</code></td></tr>
             <tr><td>mu_r</td><td>Optional relative permeability; gradients are not implemented</td><td>Tensor or <code>None</code></td></tr>
-            <tr><td>pmlthick</td><td>CPML boundary thickness</td><td>Integer or six values</td></tr>
+            <tr><td>pmlthick</td><td>External CPML thickness</td><td>Integer or four/six values</td></tr>
             <tr><td>fdtd_order</td><td>Spatial finite-difference order</td><td>2, 4, or 8</td></tr>
             <tr><td>mode</td><td>Material-gradient component mode</td><td>2 or 3</td></tr>
           </tbody></table>
+          <h3>Physical model and automatic PML</h3>
+          <p>Supply only air and the target region in <code>eps_r</code>, <code>sigma</code>, and optional <code>mu_r</code>. Each call replicates current edge values outward by the configured PML thickness. Acquisition indices start at zero in the input model; the solver shifts them internally. Remove old manual PML padding and its coordinate offsets when migrating.</p>
+          <p>For input <code>(nx, ny, nz)</code> and face widths <code>[px0, px1, py0, py1, pz0, pz1]</code>, the solver uses <code>Nx = nx + px0 + px1</code>, and likewise for Y and Z. In 2D, <code>Nz = 1</code>. Update the physical model with your FWI optimizer; PML is regenerated on the next call. Apply an air mask if air must remain fixed.</p>
+          <p>Backward holds PML materials and coefficient averages fixed and crops material gradients to the model. It does not sum PML sensitivities into edge cells. For finite-difference checks, freeze the boundary values or the PML explicitly. Native CPU/CUDA libraries must be rebuilt with the <code>deepgpr_supports_external_pml</code> capability.</p>
           <p><a href="https://github.com/songc0a/DeepGPR#compute-interface-documentation">Open the full interface documentation on GitHub ↗</a></p>
         </section>
 
@@ -137,6 +141,11 @@ result = DeepGPR.compute(
             <li><strong><code>PML_Tuple</code></strong> — 24 CPML auxiliary state tensors.</li>
             <li><strong><code>receiver_amplitudes</code></strong> — recorded data with shape <code>(nstep, nt, nrx)</code>.</li>
           </ol>
+          <p>Histories (including compressed and saved-file histories) retain the full <code>(Nx, Ny, Nz)</code> solver grid. E/H tensors have shape <code>(nstep, Nx+1, Ny+1, Nz+1)</code>, including the Yee halo. For physical history plots, slice each spatial axis from its low PML width for the input model length.</p>
+          <h3>Continuation and checkpointing</h3>
+          <p><code>checkpoint_initial_field</code> takes the physical model and allocates full-grid E/H/PML states. Pass all returned states back without cropping or padding, using the same geometry, PML settings, and shot ordering. The material model stays unextended on every segment.</p>
+          <p>The native solver advances supplied states in place. Clone all 30 boundary tensors inside a PyTorch checkpointed function before propagation, and return their final states with the receiver traces. Keep materials fixed throughout the trajectory and backward pass; start the next FWI iteration from the appropriate initial state after optimization.</p>
+          <p><a href="https://github.com/songc0a/DeepGPR/blob/main/tests/checkpoint_example.ipynb">Open the temporal checkpoint example ↗</a></p>
         </section>
 
         <section class="content-panel" id="examples">

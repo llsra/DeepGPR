@@ -174,15 +174,15 @@ def make_inputs(args):
         (args.shots, args.receivers, 3), dtype=torch.int32, device=device
     )
     shot_x = torch.linspace(
-        args.pml + 2, args.nx - args.pml - 3, args.shots, device=device
+        2, args.nx - 3, args.shots, device=device
     ).round().to(torch.int32)
     receiver_x = torch.linspace(
-        args.pml + 2, args.nx - args.pml - 3, args.receivers, device=device
+        2, args.nx - 3, args.receivers, device=device
     ).round().to(torch.int32)
     source_location[:, 0, 0] = shot_x
-    source_location[:, 0, 1] = args.pml + 2
+    source_location[:, 0, 1] = 2
     receiver_location[:, :, 0] = receiver_x
-    receiver_location[:, :, 1] = args.pml + 2
+    receiver_location[:, :, 1] = 2
     return eps_r, sigma, source, source_location, receiver_location
 
 
@@ -379,7 +379,7 @@ def main():
     parser.add_argument("--nt", type=int, default=1200)
     parser.add_argument("--shots", type=int, default=4)
     parser.add_argument("--receivers", type=int, default=64)
-    parser.add_argument("--pml", type=int, default=20)
+    parser.add_argument("--pml", type=int, help="External PML thickness added on each face", default=20)
     parser.add_argument("--dx", type=float, default=0.01)
     parser.add_argument("--dt", type=float, default=1.5e-11)
     parser.add_argument("--frequency", type=float, default=4.0e8)

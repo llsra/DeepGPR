@@ -163,6 +163,9 @@ class Int8WavefieldCompressionTests(unittest.TestCase):
         direction_eps *= 0.05 / direction_eps.abs().max().clamp_min(1.0e-30)
         direction_sigma = torch.randn_like(sigma_base)
         direction_sigma *= 1.0e-5 / direction_sigma.abs().max().clamp_min(1.0e-30)
+        direction_mask = vu.fixed_boundary_direction_mask(eps_base.shape, kwargs["pmlthick"], eps_base.device)
+        direction_eps *= direction_mask
+        direction_sigma *= direction_mask
         adjoint = float(
             (compressed["eps"] * direction_eps).sum()
             + (compressed["sigma"] * direction_sigma).sum()

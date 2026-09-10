@@ -17,6 +17,17 @@ curl operators, native field updates, all-face CPML state transposes, source
 waveform gradients, material Taylor tests, incomplete temporal sampling, and
 optional CPU/CUDA parity.
 
+`test_external_pml.py` verifies automatic edge replication against an explicitly
+extended native-grid reference in 2D and 3D, asymmetric and disabled faces,
+orders 2/4/8, model-edge gradients, physical coordinate validation, and state
+shape validation. It also runs two FWI updates with real temporal checkpoint
+recomputation, checking traces, all 30 final states, material gradients, and
+source gradients against full-history execution. CUDA parity runs when available.
+All models and acquisition coordinates now describe the physical region only.
+Finite-difference directions hold replicated boundary values fixed; this is a
+test constraint, not a mask on returned model gradients. Rebuild CPU/CUDA
+libraries with `deepgpr_supports_external_pml` before running the suite.
+
 No finite test suite can prove that a numerical program is correct for every
 possible input. The suite instead combines independent checks that are
 sensitive to different implementation errors:
@@ -26,7 +37,7 @@ sensitive to different implementation errors:
 2. `01_forward_physics.ipynb`: zero response, source linearity, source
    superposition, reciprocity, travel time, and state-continuation equivalence.
 3. `02_cpml_absorption.ipynb`: interior transparency, reflected-energy
-   reduction, thickness sweep, and zero material gradient in CPML cells.
+   reduction, thickness sweep, physical gradient shapes, and full-grid solver states.
 4. `03_gradient_2d.ipynb`: 2D Ez-TM adjoint directional derivatives for
    relative permittivity and conductivity at orders 2, 4, and 8.
 5. `04_gradient_3d.ipynb`: 3D full-vector adjoint directional derivatives for
@@ -88,8 +99,8 @@ an optimization objective; memory-bound FDTD kernels may reach their best
 runtime below the GPU's maximum power limit.
 
 `benchmark_wavefield_compression.py` runs FP32, FP16, and fused block-INT8 on
-the same acquisition. Its default case is `512 x 384`, 1200 time steps, four
-shots, and 64 receivers. The two FP32 saved histories contain about 7.0 GiB,
+the same acquisition. Its default case is `512 x 384` physical cells (552 x 424 including PML), 1200 time steps, four
+shots, and 64 receivers. The two FP32 saved histories contain about 8.37 GiB,
 which is large enough to expose bandwidth effects while fitting comfortably on
 a 24 GiB RTX 4090 with the current solver. It reports saved-history bytes, peak
 allocated CUDA memory, wall time, CUDA-event time, host/synchronization delta,
